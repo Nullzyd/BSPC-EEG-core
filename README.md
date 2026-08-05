@@ -21,5 +21,3 @@ from bspc_eeg.models.cgode_cct import CGODECCTClassifier
 ```
 
 The model interfaces accept standardized EEG tensors with shape `[batch, channels, time]`. The generator additionally receives diffusion timesteps, emotion labels, and subject identifiers.
-
-Released under the MIT License.
