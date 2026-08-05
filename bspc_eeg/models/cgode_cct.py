@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,42 +27,6 @@ def overlapping_patches(x: Tensor, patch_size: int, stride: int) -> Tensor:
             f"Input length {x.shape[-1]} is shorter than patch_size {patch_size}"
         )
     return x.unfold(dimension=-1, size=patch_size, step=stride).contiguous()
-
-
-class GlobalLogBandpower(nn.Module):
-                                                                         
-
-    def __init__(
-        self,
-        input_length: int,
-        sample_rate: float,
-        bands: Sequence[Sequence[float]],
-    ) -> None:
-        super().__init__()
-        if input_length <= 0 or sample_rate <= 0 or not bands:
-            raise ValueError("bandpower input length, sample rate, and bands must be positive")
-        frequencies = torch.fft.rfftfreq(input_length, d=1.0 / sample_rate)
-        weights = []
-        for band in bands:
-            if len(band) != 2:
-                raise ValueError("each bandpower band must contain [low, high]")
-            low, high = float(band[0]), float(band[1])
-            if not 0.0 <= low < high <= sample_rate / 2.0:
-                raise ValueError("bandpower bands must lie within the Nyquist interval")
-            mask = ((frequencies >= low) & (frequencies < high)).float()
-            if not torch.any(mask):
-                raise ValueError(f"bandpower band [{low}, {high}) contains no FFT bins")
-            weights.append(mask / mask.sum())
-        self.register_buffer("weights", torch.stack(weights), persistent=True)
-
-    @property
-    def num_bands(self) -> int:
-        return int(self.weights.shape[0])
-
-    def forward(self, signal: Tensor) -> Tensor:
-        power = torch.fft.rfft(signal, dim=-1, norm="ortho").abs().square()
-        bandpower = torch.einsum("bcf,kf->bck", power, self.weights)
-        return torch.log1p(bandpower).flatten(start_dim=1)
 
 
 class DeterministicAdaptiveMeanPool1d(nn.Module):
@@ -364,28 +328,6 @@ class CGODEBlock(nn.Module):
         return output, metadata
 
 
-class DiscreteDynamicGCN(nn.Module):
-                                                                        
-
-    def __init__(self, d_model: int, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.adjacency = DynamicAdjacency(d_model)
-        self.projection = nn.Linear(d_model, d_model, bias=False)
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, h: Tensor) -> Tuple[Tensor, Dict[str, object]]:
-        adjacency = self.adjacency(h)
-        message = torch.einsum("bij,bjpd->bipd", adjacency, h)
-        output = self.norm(h + self.dropout(F.gelu(self.projection(message))))
-        return output, {
-            "nfe": 1,
-            "adjacency": adjacency.detach(),
-            "adjacency_trace": [adjacency.detach()],
-            "solver": "discrete_gcn",
-        }
-
-
 class SinusoidalPosition(nn.Module):
     def __init__(self, d_model: int, max_length: int) -> None:
         super().__init__()
@@ -444,10 +386,6 @@ class ClassifierOutput:
 
 
 class CGODECCTClassifier(nn.Module):
-                                                                           
-
-    GRAPH_MODES = {"none", "gcn", "cgode"}
-
     def __init__(
         self,
         num_classes: int,
@@ -461,25 +399,12 @@ class CGODECCTClassifier(nn.Module):
         stem_layers: int = 2,
         dropout: float = 0.1,
         head_dropout: float = 0.3,
-        use_cct: bool = True,
-        graph_mode: str = "cgode",
-        use_stem: bool = True,
         ode_step_size: float = 0.25,
         ode_rho_init: float = 0.1,
         topology_bias: Optional[Tensor] = None,
         spectral_mode: str = "amplitude",
-        use_global_bandpower: bool = False,
-        sample_rate: float = 128.0,
-        bandpower_bands: Sequence[Sequence[float]] = (
-            (4.0, 8.0),
-            (8.0, 13.0),
-            (13.0, 30.0),
-            (30.0, 45.0),
-        ),
     ) -> None:
         super().__init__()
-        if graph_mode not in self.GRAPH_MODES:
-            raise ValueError(f"graph_mode must be one of {sorted(self.GRAPH_MODES)}")
         self.num_classes = num_classes
         self.num_channels = num_channels
         self.input_length = input_length
@@ -487,9 +412,6 @@ class CGODECCTClassifier(nn.Module):
         self.patch_stride = patch_stride
         self.patch_count = (input_length - patch_size) // patch_stride + 1
         self.d_model = d_model
-        self.use_cct = use_cct
-        self.graph_mode = graph_mode
-        self.use_stem = use_stem
 
         self.patch_embedding = DualDomainPatchEmbedding(
             num_channels=num_channels,
@@ -500,37 +422,21 @@ class CGODECCTClassifier(nn.Module):
             spectral_mode=spectral_mode,
         )
         self.cct = nn.ModuleList(
-            [
-                CrissCrossBlock(d_model, num_heads, dropout=dropout)
-                for _ in range(cct_layers)
-            ]
-            if use_cct
-            else []
+            [CrissCrossBlock(d_model, num_heads, dropout=dropout) for _ in range(cct_layers)]
         )
         self.pre_graph_norm = nn.LayerNorm(d_model)
-
-        if graph_mode == "cgode":
-            self.graph_block: Optional[nn.Module] = CGODEBlock(
-                d_model=d_model,
-                step_size=ode_step_size,
-                rho_init=ode_rho_init,
-                topology_bias=topology_bias,
-            )
-        elif graph_mode == "gcn":
-            self.graph_block = DiscreteDynamicGCN(d_model=d_model, dropout=dropout)
-        else:
-            self.graph_block = None
-
-        self.stem = (
-            STEM(
-                d_model=d_model,
-                num_heads=num_heads,
-                num_layers=stem_layers,
-                max_patches=self.patch_count,
-                dropout=dropout,
-            )
-            if use_stem
-            else nn.Identity()
+        self.graph_block = CGODEBlock(
+            d_model=d_model,
+            step_size=ode_step_size,
+            rho_init=ode_rho_init,
+            topology_bias=topology_bias,
+        )
+        self.stem = STEM(
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=stem_layers,
+            max_patches=self.patch_count,
+            dropout=dropout,
         )
         self.classifier = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -538,16 +444,6 @@ class CGODECCTClassifier(nn.Module):
             nn.GELU(),
             nn.Dropout(head_dropout),
             nn.Linear(d_model // 2, num_classes),
-        )
-        self.global_bandpower = (
-            GlobalLogBandpower(input_length, sample_rate, bandpower_bands)
-            if use_global_bandpower
-            else None
-        )
-        self.bandpower_classifier = (
-            nn.Linear(num_channels * self.global_bandpower.num_bands, num_classes)
-            if self.global_bandpower is not None
-            else None
         )
 
     def forward_features(self, x: Tensor) -> Tuple[Tensor, Tensor, Dict[str, object]]:
@@ -562,15 +458,7 @@ class CGODECCTClassifier(nn.Module):
             tokens = block(tokens)
         tokens = self.pre_graph_norm(tokens)
 
-        if self.graph_block is None:
-            graph: Dict[str, object] = {
-                "nfe": 0,
-                "adjacency": None,
-                "adjacency_trace": [],
-                "solver": "none",
-            }
-        else:
-            tokens, graph = self.graph_block(tokens)
+        tokens, graph = self.graph_block(tokens)
 
         sequence = tokens.mean(dim=1)
         sequence = self.stem(sequence)
@@ -580,98 +468,6 @@ class CGODECCTClassifier(nn.Module):
     def forward(self, x: Tensor, return_details: bool = False):
         features, tokens, graph = self.forward_features(x)
         logits = self.classifier(features)
-        if self.global_bandpower is not None and self.bandpower_classifier is not None:
-            logits = logits + self.bandpower_classifier(self.global_bandpower(x))
         if return_details:
             return ClassifierOutput(logits, features, graph, tokens)
-        return logits
-
-
-class StaticGraphLayer(nn.Module):
-    def __init__(self, d_model: int, dropout: float) -> None:
-        super().__init__()
-        self.projection = nn.Linear(d_model, d_model, bias=False)
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, h: Tensor, adjacency: Tensor) -> Tensor:
-        message = torch.einsum("ij,bjpd->bipd", adjacency, h)
-        return self.norm(h + self.dropout(F.gelu(self.projection(message))))
-
-
-class PatchGCNClassifier(nn.Module):
-                                                                               
-
-    def __init__(
-        self,
-        num_classes: int,
-        num_channels: int,
-        input_length: int,
-        patch_size: int,
-        patch_stride: int,
-        d_model: int = 64,
-        graph_layers: int = 2,
-        dropout: float = 0.1,
-        adjacency: Optional[Tensor] = None,
-        spectral_mode: str = "amplitude",
-        use_global_bandpower: bool = False,
-        sample_rate: float = 128.0,
-        bandpower_bands: Sequence[Sequence[float]] = (
-            (4.0, 8.0),
-            (8.0, 13.0),
-            (13.0, 30.0),
-            (30.0, 45.0),
-        ),
-    ) -> None:
-        super().__init__()
-        self.num_channels = num_channels
-        self.input_length = input_length
-        self.patch_size = patch_size
-        self.patch_stride = patch_stride
-        patch_count = (input_length - patch_size) // patch_stride + 1
-        self.patch_embedding = DualDomainPatchEmbedding(
-            num_channels=num_channels,
-            num_patches=patch_count,
-            patch_size=patch_size,
-            d_model=d_model,
-            temporal_channels=8,
-            dropout=dropout,
-            spectral_mode=spectral_mode,
-        )
-        if adjacency is None:
-            adjacency = torch.eye(num_channels)
-        if adjacency.shape != (num_channels, num_channels):
-            raise ValueError("adjacency must have shape [C, C]")
-        adjacency = adjacency.float().clamp_min(0)
-        adjacency = adjacency + torch.eye(num_channels, dtype=adjacency.dtype)
-        adjacency = adjacency / adjacency.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        self.register_buffer("adjacency", adjacency)
-        self.layers = nn.ModuleList(
-            [StaticGraphLayer(d_model, dropout) for _ in range(graph_layers)]
-        )
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(d_model), nn.Linear(d_model, num_classes)
-        )
-        self.global_bandpower = (
-            GlobalLogBandpower(input_length, sample_rate, bandpower_bands)
-            if use_global_bandpower
-            else None
-        )
-        self.bandpower_classifier = (
-            nn.Linear(num_channels * self.global_bandpower.num_bands, num_classes)
-            if self.global_bandpower is not None
-            else None
-        )
-
-    def forward_features(self, x: Tensor) -> Tensor:
-        patches = overlapping_patches(x, self.patch_size, self.patch_stride)
-        tokens = self.patch_embedding(patches)
-        for layer in self.layers:
-            tokens = layer(tokens, self.adjacency)
-        return tokens.mean(dim=(1, 2))
-
-    def forward(self, x: Tensor) -> Tensor:
-        logits = self.classifier(self.forward_features(x))
-        if self.global_bandpower is not None and self.bandpower_classifier is not None:
-            logits = logits + self.bandpower_classifier(self.global_bandpower(x))
         return logits
