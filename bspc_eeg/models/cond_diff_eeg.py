@@ -128,11 +128,7 @@ class JointConditioner(nn.Module):
             nn.SiLU(),
             nn.Linear(config.embed_dim, config.embed_dim),
         )
-        self.gate = nn.Sequential(
-            nn.Linear(2 * config.embed_dim, config.embed_dim),
-            nn.GELU(),
-            nn.Linear(config.embed_dim, config.embed_dim),
-        )
+        self.gate = nn.Linear(2 * config.embed_dim, config.embed_dim)
 
     def _resolve_drop_mask(
         self,
