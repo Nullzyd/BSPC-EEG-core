@@ -11,7 +11,7 @@ Dataset processing, diffusion schedules, samplers, reconstruction losses, joint-
 
 ## Model settings
 
-The released defaults follow the revised manuscript. CondDiffEEG uses an embedding dimension of 512, 8 DiT blocks, 16 attention heads, an FFN expansion ratio of 4, generator patch size 4, multi-scale kernels `(1, 3, 7, 15)`, and condition dropout 0.15. CGODE-CCT uses a hidden dimension of 256, 12 criss-cross blocks, 8 attention heads, 2 STEM layers, dropout 0.1, classification-head dropout 0.3, and fixed-step RK4 integration over `[0, 1]` with step size 0.25 and nonnegative decay initialization 0.1. Dataset-specific temporal patch settings are `128/64` for DEAP and DREAMER and `200/100` for SEED.
+The released defaults follow the revised manuscript. CondDiffEEG uses an embedding dimension of 512, 8 DiT blocks, 16 attention heads, an FFN expansion ratio of 4, overlapping generator patches with size 4 and stride 2, multi-scale kernels `(1, 3, 7, 15)`, and condition dropout 0.15. CGODE-CCT uses a hidden dimension of 256, 12 criss-cross blocks, 8 attention heads, 2 STEM layers, dropout 0.1, classification-head dropout 0.3, and fixed-step RK4 integration over `[0, 1]` with step size 0.25 and nonnegative decay initialization 0.1. Dataset-specific classifier patch settings are `128/64` for DEAP and DREAMER and `200/100` for SEED.
 
 ## Core imports
 

@@ -27,6 +27,7 @@ class CondDiffEEGConfig:
     in_channels: int = 32
     time_points: int = 1280
     patch_size: int = 4
+    patch_stride: int = 2
     embed_dim: int = 512
     depth: int = 8
     num_heads: int = 16
@@ -42,8 +43,12 @@ class CondDiffEEGConfig:
     def __post_init__(self) -> None:
         if self.in_channels <= 0 or self.time_points <= 0:
             raise ValueError("in_channels and time_points must be positive")
-        if self.patch_size <= 0 or self.time_points % self.patch_size != 0:
-            raise ValueError("patch_size must evenly divide time_points")
+        if self.patch_size <= 0 or self.patch_size > self.time_points:
+            raise ValueError("patch_size must be positive and no greater than time_points")
+        if self.patch_stride <= 0 or self.patch_stride >= self.patch_size:
+            raise ValueError("patch_stride must be positive and smaller than patch_size")
+        if (self.time_points - self.patch_size) % self.patch_stride != 0:
+            raise ValueError("patch_stride must provide complete temporal coverage")
         if self.embed_dim <= 0 or self.embed_dim % self.num_heads != 0:
             raise ValueError("embed_dim must be positive and divisible by num_heads")
         if not self.multiscale_kernels:
@@ -207,7 +212,7 @@ class MultiScalePatchEmbedding(nn.Module):
             config.embed_dim,
             config.embed_dim,
             kernel_size=config.patch_size,
-            stride=config.patch_size,
+            stride=config.patch_stride,
         )
         attention_hidden = max(config.embed_dim // 4, 1)
         self.channel_attention_norm = nn.LayerNorm(config.embed_dim)
@@ -299,7 +304,9 @@ class CondDiffEEG(nn.Module):
             raise ValueError("pass either config or keyword overrides, not both")
         self.config = config if config is not None else CondDiffEEGConfig(**overrides)
         config = self.config
-        self.patch_count = config.time_points // config.patch_size
+        self.patch_count = (
+            config.time_points - config.patch_size
+        ) // config.patch_stride + 1
 
         self.patch_embedding = MultiScalePatchEmbedding(config)
         self.position_embedding = nn.Parameter(torch.empty(1, self.patch_count, config.embed_dim))
@@ -386,14 +393,37 @@ class CondDiffEEG(nn.Module):
         tokens = _modulate(self.final_norm(tokens), shift, scale)
         patches = self.output_projection(tokens)
         batch_size = signal.shape[0]
-        epsilon = patches.view(
+        patches = patches.view(
             batch_size,
             self.patch_count,
             self.config.patch_size,
             self.config.in_channels,
         )
-        epsilon = epsilon.permute(0, 3, 1, 2).contiguous()
-        epsilon = epsilon.view(batch_size, self.config.in_channels, self.config.time_points)
+        patches = patches.permute(0, 3, 2, 1).contiguous()
+        patches = patches.view(
+            batch_size,
+            self.config.in_channels * self.config.patch_size,
+            self.patch_count,
+        )
+        epsilon = F.fold(
+            patches,
+            output_size=(1, self.config.time_points),
+            kernel_size=(1, self.config.patch_size),
+            stride=(1, self.config.patch_stride),
+        ).view(batch_size, self.config.in_channels, self.config.time_points)
+        overlap = F.fold(
+            torch.ones(
+                1,
+                self.config.patch_size,
+                self.patch_count,
+                device=patches.device,
+                dtype=patches.dtype,
+            ),
+            output_size=(1, self.config.time_points),
+            kernel_size=(1, self.config.patch_size),
+            stride=(1, self.config.patch_stride),
+        ).view(1, 1, self.config.time_points)
+        epsilon = epsilon / overlap.clamp_min(torch.finfo(epsilon.dtype).eps)
         if self.config.input_skip_mode == "timestep_linear":
             skip_weight = timesteps.to(dtype=signal.dtype) / float(
                 self.config.num_diffusion_steps - 1
