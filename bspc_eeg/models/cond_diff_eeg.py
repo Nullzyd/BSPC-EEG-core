@@ -128,7 +128,11 @@ class JointConditioner(nn.Module):
             nn.SiLU(),
             nn.Linear(config.embed_dim, config.embed_dim),
         )
-        self.gate = nn.Linear(2 * config.embed_dim, config.embed_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(2 * config.embed_dim, config.embed_dim),
+            nn.GELU(),
+            nn.Linear(config.embed_dim, config.embed_dim),
+        )
 
     def _resolve_drop_mask(
         self,
@@ -147,8 +151,9 @@ class JointConditioner(nn.Module):
     def _decorrelation(emotion: Tensor, subject: Tensor) -> Tensor:
         emotion_normalized = F.normalize(emotion, dim=-1, eps=1e-8)
         subject_normalized = F.normalize(subject, dim=-1, eps=1e-8)
-        cosine = (emotion_normalized * subject_normalized).sum(dim=-1)
-        return cosine.square().mean()
+        cross_similarity = emotion_normalized.transpose(0, 1) @ subject_normalized
+        cross_similarity = cross_similarity / emotion.shape[0]
+        return cross_similarity.square().sum()
 
     def forward(
         self,
